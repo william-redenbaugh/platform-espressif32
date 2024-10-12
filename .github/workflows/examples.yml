@@ -30,7 +30,6 @@ jobs:
           - "examples/espidf-storage-sdcard"
           - "examples/espidf-ulp"
           - "examples/espidf-ulp-riscv"
-          - "examples/tasmota"
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
