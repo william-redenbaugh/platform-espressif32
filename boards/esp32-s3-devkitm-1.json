@@ -1,7 +1,6 @@
 {
   "build": {
     "arduino":{
-      "ldscript": "esp32s3_out.ld",
       "partitions": "default_8MB.csv"
     },
     "core": "esp32",
@@ -24,6 +23,7 @@
     "variant": "esp32s3"
   },
   "connectivity": [
+    "bluetooth",
     "wifi"
   ],
   "debug": {

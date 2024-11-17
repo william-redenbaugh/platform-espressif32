@@ -70,20 +70,29 @@ def _get_board_memory_type(env):
         ),
     )
 
-def _get_board_img_freq(env):
-    board_config = env.BoardConfig()
-    img_freq = board_config.get("build.img_freq", "")
-    if img_freq =="":
-        img_freq = board_config.get("build.f_flash", "")
-    img_freq = str(img_freq).replace("L", "")
-    return str(int(int(img_freq) / 1000000)) + "m"
+def _normalize_frequency(frequency):
+    frequency = str(frequency).replace("L", "")
+    return str(int(int(frequency) / 1000000)) + "m"
 
 
 def _get_board_f_flash(env):
+    frequency = env.subst("$BOARD_F_FLASH")
+    return _normalize_frequency(frequency)
+
+
+def _get_board_f_image(env):
     board_config = env.BoardConfig()
-    frequency = board_config.get("build.f_flash", "")
-    frequency = str(frequency).replace("L", "")
-    return str(int(int(frequency) / 1000000)) + "m"
+    if "build.f_image" in board_config:
+        return _normalize_frequency(board_config.get("build.f_image"))
+
+    return _get_board_f_flash(env)
+
+def _get_board_f_boot(env):
+    board_config = env.BoardConfig()
+    if "build.f_boot" in board_config:
+        return _normalize_frequency(board_config.get("build.f_boot"))
+
+    return _get_board_f_flash(env)
 
 
 def _get_board_flash_mode(env):
@@ -130,7 +139,7 @@ def _parse_partitions(env):
 
     result = []
     next_offset = 0
-    bound = int(board.get("upload.offset_address", "0x10000"), 16) # default 0x10000
+    app_offset = int(board.get("upload.offset_address", "0x10000"), 16) # default 0x10000
     with open(partitions_csv) as fp:
         for line in fp.readlines():
             line = line.strip()
@@ -139,35 +148,56 @@ def _parse_partitions(env):
             tokens = [t.strip() for t in line.split(",")]
             if len(tokens) < 5:
                 continue
+            bound = 0x10000 if tokens[1] in ("0", "app") else 4
+            calculated_offset = (next_offset + bound - 1) & ~(bound - 1)
             partition = {
                 "name": tokens[0],
                 "type": tokens[1],
                 "subtype": tokens[2],
-                "offset": tokens[3] or next_offset,
+                "offset": tokens[3] or calculated_offset,
                 "size": tokens[4],
                 "flags": tokens[5] if len(tokens) > 5 else None
             }
             result.append(partition)
             next_offset = _parse_size(partition["offset"])
             if (partition["subtype"] == "ota_0"):
-                bound = next_offset
-            next_offset = (next_offset + bound - 1) & ~(bound - 1)
+                app_offset = next_offset
+            next_offset = next_offset + _parse_size(partition["size"])
     # Configure application partition offset
-    env.Replace(ESP32_APP_OFFSET=str(hex(bound)))
+    env.Replace(ESP32_APP_OFFSET=str(hex(app_offset)))
     # Propagate application offset to debug configurations
-    env["INTEGRATION_EXTRA_DATA"].update({"application_offset": str(hex(bound))})
+    env["INTEGRATION_EXTRA_DATA"].update({"application_offset": str(hex(app_offset))})
     return result
 
 
 def _update_max_upload_size(env):
     if not env.get("PARTITIONS_TABLE_CSV"):
         return
-    sizes = [
-        _parse_size(p["size"]) for p in _parse_partitions(env)
+    sizes = {
+        p["subtype"]: _parse_size(p["size"]) for p in _parse_partitions(env)
         if p["type"] in ("0", "app")
-    ]
-    if sizes:
-        board.update("upload.maximum_size", max(sizes))
+    }
+
+    partitions = {p["name"]: p for p in _parse_partitions(env)}
+
+    # User-specified partition name has the highest priority
+    custom_app_partition_name = board.get("build.app_partition_name", "")
+    if custom_app_partition_name:
+        selected_partition = partitions.get(custom_app_partition_name, {})
+        if selected_partition:
+            board.update("upload.maximum_size", _parse_size(selected_partition["size"]))
+            return
+        else:
+            print(
+                "Warning! Selected partition `%s` is not available in the partition " \
+                "table! Default partition will be used!" % custom_app_partition_name
+            )
+
+    for p in partitions.values():
+        if p["type"] in ("0", "app") and p["subtype"] in ("ota_0"):
+            board.update("upload.maximum_size", _parse_size(p["size"]))
+            break
+
 
 
 def _to_unix_slashes(path):
@@ -182,7 +212,7 @@ def _to_unix_slashes(path):
 def fetch_fs_size(env):
     fs = None
     for p in _parse_partitions(env):
-        if p["type"] == "data" and p["subtype"] in ("spiffs", "fat"):
+        if p["type"] == "data" and p["subtype"] in ("spiffs", "fat", "littlefs"):
             fs = p
     if not fs:
         sys.stderr.write(
@@ -211,7 +241,7 @@ def __fetch_fs_size(target, source, env):
 board = env.BoardConfig()
 mcu = board.get("build.mcu", "esp32")
 toolchain_arch = "xtensa-%s" % mcu
-filesystem = board.get("build.filesystem", "spiffs")
+filesystem = board.get("build.filesystem", "littlefs")
 if mcu in ("esp32c2", "esp32c3", "esp32c6", "esp32h2"):
     toolchain_arch = "riscv32-esp"
 
@@ -221,7 +251,8 @@ if "INTEGRATION_EXTRA_DATA" not in env:
 env.Replace(
     __get_board_boot_mode=_get_board_boot_mode,
     __get_board_f_flash=_get_board_f_flash,
-    __get_board_img_freq=_get_board_img_freq,
+    __get_board_f_image=_get_board_f_image,
+    __get_board_f_boot=_get_board_f_boot,
     __get_board_flash_mode=_get_board_flash_mode,
     __get_board_memory_type=_get_board_memory_type,
 
@@ -232,7 +263,7 @@ env.Replace(
     GDB=join(
         platform.get_package_dir(
             "tool-riscv32-esp-elf-gdb"
-            if mcu in ("esp32c2", "esp32c3", "esp32c6")
+            if mcu in ("esp32c2", "esp32c3", "esp32c6", "esp32h2")
             else "tool-xtensa-esp-elf-gdb"
         )
         or "",
@@ -256,20 +287,8 @@ env.Replace(
     ],
     ERASECMD='"$PYTHONEXE" "$OBJCOPY" $ERASEFLAGS erase_flash',
 
-    # mkspiffs package contains two different binaries for IDF and Arduino
-    MKFSTOOL="mk%s" % filesystem
-    + (
-        (
-            "_${PIOPLATFORM}_"
-            + (
-                "espidf"
-                if "espidf" in env.subst("$PIOFRAMEWORK")
-                else "${PIOFRAMEWORK}"
-            )
-        )
-        if filesystem == "spiffs"
-        else ""
-    ),
+    MKFSTOOL="mk%s" % filesystem,
+
     # Legacy `ESP32_SPIFFS_IMAGE_NAME` is used as the second fallback value for
     # backward compatibility
     ESP32_FS_IMAGE_NAME=env.get(
@@ -291,9 +310,8 @@ env.Append(
             action=env.VerboseAction(" ".join([
                 '"$PYTHONEXE" "$OBJCOPY"',
                 "--chip", mcu, "elf2image",
-                "--dont-append-digest",
                 "--flash_mode", "${__get_board_flash_mode(__env__)}",
-                "--flash_freq", "${__get_board_img_freq(__env__)}",
+                "--flash_freq", "${__get_board_f_image(__env__)}",
                 "--flash_size", board.get("upload.flash_size", "4MB"),
                 "-o", "$TARGET", "$SOURCES"
             ]), "Building $TARGET"),
@@ -310,7 +328,7 @@ env.Append(
                             "-b",
                             "$FS_BLOCK",
                         ]
-                        if filesystem in ("spiffs", "littlefs")
+                        if filesystem in ("littlefs", "spiffs")
                         else []
                     )
                     + ["$TARGET"]
@@ -363,9 +381,6 @@ if env.get("PIOMAINPROG"):
         env.VerboseAction(
             lambda source, target, env: _update_max_upload_size(env),
             "Retrieving maximum program size $SOURCES"))
-# remove after PIO Core 3.6 release
-elif set(["checkprogsize", "upload"]) & set(COMMAND_LINE_TARGETS):
-    _update_max_upload_size(env)
 
 #
 # Target: Print binary size
@@ -427,7 +442,7 @@ elif upload_protocol == "esptool":
             "--after", board.get("upload.after_reset", "hard_reset"),
             "write_flash", "-z",
             "--flash_mode", "${__get_board_flash_mode(__env__)}",
-            "--flash_freq", "${__get_board_img_freq(__env__)}",
+            "--flash_freq", "${__get_board_f_image(__env__)}",
             "--flash_size", "detect"
         ],
         UPLOADCMD='"$PYTHONEXE" "$UPLOADER" $UPLOADERFLAGS $ESP32_APP_OFFSET $SOURCE'
@@ -445,7 +460,7 @@ elif upload_protocol == "esptool":
                 "--after", board.get("upload.after_reset", "hard_reset"),
                 "write_flash", "-z",
                 "--flash_mode", "${__get_board_flash_mode(__env__)}",
-                "--flash_freq", "${__get_board_img_freq(__env__)}",
+                "--flash_freq", "${__get_board_f_image(__env__)}",
                 "--flash_size", "detect",
                 "$FS_START"
             ],
@@ -486,6 +501,8 @@ elif upload_protocol in debug_tools:
         debug_tools.get(upload_protocol).get("server").get("arguments", []))
     openocd_args.extend(
         [
+            "-c",
+            "adapter speed %s" % env.GetProjectOption("debug_speed", "5000"),
             "-c",
             "program_esp {{$SOURCE}} %s verify"
             % (
@@ -539,7 +556,7 @@ env.AddPlatformTarget(
     "erase_upload",
     target_firm,
     [
-        env.VerboseAction(env.AutodetectUploadPort, "Looking for serial port..."),
+        env.VerboseAction(BeforeUpload, "Looking for upload port..."),
         env.VerboseAction("$ERASECMD", "Erasing..."),
         env.VerboseAction("$UPLOADCMD", "Uploading $SOURCE")
     ],
@@ -554,7 +571,7 @@ env.AddPlatformTarget(
     "erase",
     None,
     [
-        env.VerboseAction(env.AutodetectUploadPort, "Looking for serial port..."),
+        env.VerboseAction(BeforeUpload, "Looking for upload port..."),
         env.VerboseAction("$ERASECMD", "Erasing...")
     ],
     "Erase Flash",

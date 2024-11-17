@@ -13,14 +13,15 @@
 # limitations under the License.
 
 import os
+import sys
 
 from platformio import fs
 from platformio.util import get_systype
-from platformio.proc import where_is_program
+from platformio.proc import where_is_program, exec_command
 
 from SCons.Script import Import
 
-Import("env sdk_config project_config idf_variant")
+Import("env sdk_config project_config app_includes idf_variant")
 
 ulp_env = env.Clone()
 platform = ulp_env.PioPlatform()
@@ -34,22 +35,25 @@ ULP_BUILD_DIR = os.path.join(
 def prepare_ulp_env_vars(env):
     ulp_env.PrependENVPath("IDF_PATH", FRAMEWORK_DIR)
 
+    toolchain_path = platform.get_package_dir(
+        "toolchain-xtensa-%s" % idf_variant
+        if idf_variant not in ("esp32c6", "esp32p4")
+        else "toolchain-riscv32-esp"
+    )
+
+    toolchain_path_ulp = platform.get_package_dir(
+        "toolchain-esp32ulp"
+        if sdk_config.get("ULP_COPROC_TYPE_FSM", False)
+        else ""
+    )
+
     additional_packages = [
-        os.path.join(
-            platform.get_package_dir("toolchain-xtensa-%s" % idf_variant),
-            "bin",
-        ),
-        os.path.join(
-            platform.get_package_dir("toolchain-esp32ulp"),
-            "bin",
-        ),
+        toolchain_path,
+        toolchain_path_ulp,
         platform.get_package_dir("tool-ninja"),
         os.path.join(platform.get_package_dir("tool-cmake"), "bin"),
         os.path.dirname(where_is_program("python")),
     ]
-
-    if "windows" in get_systype():
-        additional_packages.append(platform.get_package_dir("tool-mconf"))
 
     for package in additional_packages:
         ulp_env.PrependENVPath("PATH", package)
@@ -57,7 +61,7 @@ def prepare_ulp_env_vars(env):
 
 def collect_ulp_sources():
     return [
-        fs.to_unix_path(os.path.join(ulp_env.subst("$PROJECT_DIR"), "ulp", f))
+        os.path.join(ulp_env.subst("$PROJECT_DIR"), "ulp", f)
         for f in os.listdir(os.path.join(ulp_env.subst("$PROJECT_DIR"), "ulp"))
         if f.endswith((".c", ".S", ".s"))
     ]
@@ -77,41 +81,63 @@ def get_component_includes(target_config):
 
 
 def generate_ulp_config(target_config):
-    riscv_ulp_enabled = sdk_config.get("ULP_COPROC_TYPE_RISCV", False)
+    def _generate_ulp_configuration_action(env, target, source):
+        riscv_ulp_enabled = sdk_config.get("ULP_COPROC_TYPE_RISCV", False)
+        lp_core_ulp_enabled = sdk_config.get("ULP_COPROC_TYPE_LP_CORE", False)
+
+        if lp_core_ulp_enabled == False:
+            ulp_toolchain = "toolchain-%sulp%s.cmake"% (
+                "" if riscv_ulp_enabled else idf_variant + "-",
+                "-riscv" if riscv_ulp_enabled else "",
+            )
+        else:
+            ulp_toolchain = "toolchain-lp-core-riscv.cmake"
+
+        comp_includes = ";".join(get_component_includes(target_config))
+        plain_includes = ";".join(app_includes["plain_includes"])
+        comp_includes = comp_includes + plain_includes
+
+        cmd = (
+            os.path.join(platform.get_package_dir("tool-cmake"), "bin", "cmake"),
+            "-DCMAKE_GENERATOR=Ninja",
+            "-DCMAKE_TOOLCHAIN_FILE="
+            + os.path.join(
+                FRAMEWORK_DIR,
+                "components",
+                "ulp",
+                "cmake",
+                ulp_toolchain,
+            ),
+            "-DULP_S_SOURCES=%s" % ";".join([fs.to_unix_path(s.get_abspath()) for s in source]),
+            "-DULP_APP_NAME=ulp_main",
+            "-DCOMPONENT_DIR=" + os.path.join(ulp_env.subst("$PROJECT_DIR"), "ulp"),
+            "-DCOMPONENT_INCLUDES=" + comp_includes,
+            "-DIDF_TARGET=%s" % idf_variant,
+            "-DIDF_PATH=" + fs.to_unix_path(FRAMEWORK_DIR),
+            "-DSDKCONFIG_HEADER=" + os.path.join(BUILD_DIR, "config", "sdkconfig.h"),
+            "-DPYTHON=" + env.subst("$PYTHONEXE"),
+            "-DULP_COCPU_IS_RISCV=%s" % ("ON" if riscv_ulp_enabled else "OFF"),
+            "-DULP_COCPU_IS_LP_CORE=%s" % ("ON" if lp_core_ulp_enabled else "OFF"),
+            "-GNinja",
+            "-B",
+            ULP_BUILD_DIR,
+            os.path.join(FRAMEWORK_DIR, "components", "ulp", "cmake"),
+        )
+
+        result = exec_command(cmd)
+        if result["returncode"] != 0:
+            sys.stderr.write(result["err"] + "\n")
+            env.Exit(1)
 
     ulp_sources = collect_ulp_sources()
     ulp_sources.sort()
-    cmd = (
-        os.path.join(platform.get_package_dir("tool-cmake"), "bin", "cmake"),
-        "-DCMAKE_GENERATOR=Ninja",
-        "-DCMAKE_TOOLCHAIN_FILE="
-        + os.path.join(
-            FRAMEWORK_DIR,
-            "components",
-            "ulp",
-            "cmake",
-            "toolchain-%sulp%s.cmake"
-            % ("" if riscv_ulp_enabled else idf_variant + "-", "-riscv" if riscv_ulp_enabled else ""),
-        ),
-        '-DULP_S_SOURCES="%s"' % ";".join(ulp_sources),
-        "-DULP_APP_NAME=ulp_main",
-        "-DCOMPONENT_DIR=" + os.path.join(ulp_env.subst("$PROJECT_DIR"), "ulp"),
-        '-DCOMPONENT_INCLUDES="%s"' % ";".join(get_component_includes(target_config)),
-        "-DIDF_TARGET=%s" % idf_variant,
-        "-DIDF_PATH=" + fs.to_unix_path(FRAMEWORK_DIR),
-        "-DSDKCONFIG_HEADER=" + os.path.join(BUILD_DIR, "config", "sdkconfig.h"),
-        "-DPYTHON=" + env.subst("$PYTHONEXE"),
-        "-DULP_COCPU_IS_RISCV=%s" % ("ON" if riscv_ulp_enabled else "OFF"),
-        "-GNinja",
-        "-B",
-        ULP_BUILD_DIR,
-        os.path.join(FRAMEWORK_DIR, "components", "ulp", "cmake"),
-    )
 
     return ulp_env.Command(
         os.path.join(ULP_BUILD_DIR, "build.ninja"),
         ulp_sources,
-        ulp_env.VerboseAction(" ".join(cmd), "Generating ULP configuration"),
+        ulp_env.VerboseAction(
+            _generate_ulp_configuration_action, "Generating ULP configuration"
+        ),
     )
 
 
@@ -124,14 +150,19 @@ def compile_ulp_binary():
         "build",
     )
 
-    return ulp_env.Command(
+    # The `build.ninja` dependency is always generated with the same content
+    # so a cloned environment with a decider that depends on a timestamp is used
+    ulp_binary_env = ulp_env.Clone()
+    ulp_binary_env.Decider("timestamp-newer")
+
+    return ulp_binary_env.Command(
         [
             os.path.join(ULP_BUILD_DIR, "ulp_main.h"),
             os.path.join(ULP_BUILD_DIR, "ulp_main.ld"),
             os.path.join(ULP_BUILD_DIR, "ulp_main.bin"),
         ],
         None,
-        ulp_env.VerboseAction(" ".join(cmd), "Generating ULP project files $TARGETS"),
+        ulp_binary_env.VerboseAction(" ".join(cmd), "Generating ULP project files $TARGETS"),
     )
 
 
